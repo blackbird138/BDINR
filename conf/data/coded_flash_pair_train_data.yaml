@@ -1,0 +1,16 @@
+# @package data_loader
+_target_: srcs.data_loader.coded_flash_pair_data_loaders.get_coded_flash_pair_loaders
+root: /openbayes/input/input0/many_foreground_depth_v1_train/train
+batch_size: 1
+frame_indices: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+code: ${arch.ce_code_init}
+read_source: npz
+patch_size: 128
+tform_op: [flip, rotate]
+status: train
+shuffle: true
+num_workers: ${num_workers}
+pin_memory: true
+prefetch_factor: 1
+train_fraction: 0.90
+val_fraction: 0.05

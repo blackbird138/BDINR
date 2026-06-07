@@ -1,0 +1,54 @@
+##### hydra
+hydra:
+    run:
+      dir: ./outputs/${exp_name}/${status}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+    sweep:
+      dir: ./outputs/${exp_name}/${status}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+      subdir: ${hydra.job.override_dirname}
+
+##### dir
+exp_name: coded_flash/BDNeRV_RC_baseline
+trainer_name: coded_flash_trainer
+status: train
+resume_conf:
+resume:
+checkpoint_dir: checkpoints/
+final_test_dir: final_test/
+log_dir: events/
+
+##### run
+gpus: [0]
+num_workers: 2
+trainer:
+  epochs: 500
+  limit_train_iters: 500
+  limit_valid_iters: 50
+  monitor: min loss/valid
+  saving_top_k: 5
+  landmark_list: [100,200,300,400]
+  early_stop:
+  logging_step: 100
+  tensorboard: true
+  final_test: false
+
+# params
+frame_n: 16
+
+##### metrics
+metrics:
+  - _target_: srcs.metric.metric_iqa.IQA_Metric
+    metric_name: psnr
+  - _target_: srcs.metric.metric_iqa.IQA_Metric
+    metric_name: ssim
+
+##### data&nets
+defaults:
+  - data: coded_flash_pair_train_data
+  - network: coded_flash
+  - override hydra/job_logging : custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+data_loader:
+  batch_size: 2
+  patch_size: 256
