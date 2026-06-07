@@ -266,16 +266,11 @@ def _scene_has_source(scene_path: Path, frame_indices: list[int], read_source: s
 
 def _scene_has_npz(scene_path: Path, frame_indices: list[int]) -> bool:
     path = scene_path / "frames_float.npz"
-    if not path.is_file():
-        return False
-    try:
-        with np.load(path) as data:
-            if "off" not in data or "on" not in data:
-                return False
-            frame_count = int(data["off"].shape[0])
-            return data["off"].shape == data["on"].shape and max(frame_indices) < frame_count
-    except Exception:
-        return False
+    # Keep scene discovery cheap. Opening a compressed NPZ and touching arrays
+    # decompresses data; doing that for thousands of scenes can stall startup
+    # before the model ever reaches the GPU. Full key/shape validation happens
+    # when a sample is actually read in _read_scene_npz.
+    return path.is_file()
 
 
 def _to_chw_tensor(image: np.ndarray) -> torch.Tensor:
