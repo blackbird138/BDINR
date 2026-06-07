@@ -30,6 +30,8 @@ trainer:
   logging_step: 1
   tensorboard: true
   final_test: false
+  skip_nonfinite: false
+  metric_clamp: true
 
 # params
 frame_n: 16

@@ -63,16 +63,16 @@ class BatchMetrics:
 
     def reset(self):
         for col in self._data.columns:
-            self._data[col].values[:] = 0
+            self._data.loc[:, col] = 0.0
 
     def update(self, key, value, n=1):
         if self.postfix:
             key = key + self.postfix
         if self.writer is not None:
             self.writer.add_scalar(key, value)
-        self._data.total[key] += value * n
-        self._data.counts[key] += n
-        self._data.average[key] = self._data.total[key] / self._data.counts[key]
+        self._data.loc[key, 'total'] += value * n
+        self._data.loc[key, 'counts'] += n
+        self._data.loc[key, 'average'] = self._data.loc[key, 'total'] / self._data.loc[key, 'counts']
 
     def avg(self, key):
         if self.postfix:

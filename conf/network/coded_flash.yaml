@@ -15,11 +15,12 @@ reblur_loss:
 
 optimizer:
   _target_: srcs.optimizer.adan.Adan
-  lr: !!float 5e-4
+  lr: !!float 1e-4
+  max_grad_norm: 1.0
 lr_scheduler:
   _target_: srcs.scheduler._base_scheduler.getGradualWarmupScheduler
   multiplier: 1
-  warmup_epochs: 1
+  warmup_epochs: 2
   after_scheduler_conf:
     type: torch.optim.lr_scheduler.CosineAnnealingLR
     args:

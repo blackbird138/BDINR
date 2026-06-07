@@ -44,8 +44,11 @@ class Trainer(BaseTrainer):
         self.train_metrics = BatchMetrics(*args, postfix="/train", writer=self.writer)
         self.valid_metrics = BatchMetrics(*args, postfix="/valid", writer=self.writer)
         self.losses = self.config["loss"]
+        trainer_conf = self.config["trainer"]
+        self.skip_nonfinite = trainer_conf.get("skip_nonfinite", False)
+        self.metric_clamp = trainer_conf.get("metric_clamp", True)
 
-    def _compute_loss_and_metrics(self, batch, phase: str):
+    def _compute_loss(self, batch):
         coded = batch["coded_image"]
         target = batch["target"]
         off_frames = batch["off_frames"]
@@ -56,17 +59,25 @@ class Trainer(BaseTrainer):
         target_flat = torch.flatten(target, end_dim=1)
 
         loss = self.losses["main_loss"] * self.criterion["main_loss"](output_flat, target_flat)
+        reblurred = None
         if "reblur_loss" in self.losses:
             reblurred = coded_flash_reblur(output, off_frames, code)
             loss = loss + self.losses["reblur_loss"] * self.criterion["reblur_loss"](reblurred, coded)
 
+        return loss, output, reblurred
+
+    def _compute_metrics(self, output, target):
+        output_flat = torch.flatten(output, end_dim=1)
+        target_flat = torch.flatten(target, end_dim=1)
         metrics = {}
+        metric_output = _prepare_metric_input(output_flat, self.metric_clamp)
+        metric_target = _prepare_metric_input(target_flat, self.metric_clamp)
         for metric in self.metric_ftns:
-            metric_value = metric(output_flat, target_flat)
+            metric_value = metric(metric_output, metric_target)
             if self.config.n_gpu > 1:
                 metric_value = collect(metric_value)
             metrics[metric.__name__] = metric_value
-        return loss, metrics, output
+        return metrics
 
     def _after_iter(self, epoch, batch_idx, phase, loss, metrics):
         self.writer.set_step(
@@ -86,13 +97,43 @@ class Trainer(BaseTrainer):
 
         for batch_idx, batch in enumerate(self.data_loader):
             batch = _move_batch(batch, self.device)
-            loss, metrics, output = self._compute_loss_and_metrics(batch, "train")
+            loss, output, reblurred = self._compute_loss(batch)
 
             self.optimizer.zero_grad()
+            if not torch.isfinite(loss):
+                message = self._format_nonfinite_debug(
+                    "non-finite loss",
+                    batch_idx,
+                    batch,
+                    loss,
+                    output,
+                    reblurred,
+                )
+                if self.skip_nonfinite:
+                    self.logger.warning(message)
+                    continue
+                raise FloatingPointError(message)
             loss.backward()
+            grad_stats = _gradient_stats(self.model)
+            if not grad_stats["finite"]:
+                message = self._format_nonfinite_debug(
+                    "non-finite gradients",
+                    batch_idx,
+                    batch,
+                    loss,
+                    output,
+                    reblurred,
+                    grad_stats=grad_stats,
+                )
+                self.optimizer.zero_grad()
+                if self.skip_nonfinite:
+                    self.logger.warning(message)
+                    continue
+                raise FloatingPointError(message)
             self.optimizer.step()
 
             if batch_idx % self.logging_step == 0 or (batch_idx + 1) == self.limit_train_iters:
+                metrics = self._compute_metrics(output, batch["target"])
                 self._after_iter(epoch, batch_idx, "train", loss, metrics)
                 self.logger.info(
                     f"Train Epoch: {epoch} {self._progress(batch_idx)} "
@@ -124,7 +165,19 @@ class Trainer(BaseTrainer):
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.valid_data_loader):
                 batch = _move_batch(batch, self.device)
-                loss, metrics, output = self._compute_loss_and_metrics(batch, "valid")
+                loss, output, reblurred = self._compute_loss(batch)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        self._format_nonfinite_debug(
+                            "non-finite validation loss",
+                            batch_idx,
+                            batch,
+                            loss,
+                            output,
+                            reblurred,
+                        )
+                    )
+                metrics = self._compute_metrics(output, batch["target"])
                 self._after_iter(epoch, batch_idx, "valid", loss, metrics)
                 last_images = (batch, output.detach())
                 if (batch_idx + 1) == self.limit_valid_iters:
@@ -156,6 +209,37 @@ class Trainer(BaseTrainer):
         if dist.is_initialized():
             current *= dist.get_world_size()
         return "[{}/{} ({:.0f}%)]".format(current, total, 100.0 * current / total)
+
+    def _format_nonfinite_debug(
+        self,
+        reason,
+        batch_idx,
+        batch,
+        loss,
+        output,
+        reblurred=None,
+        grad_stats=None,
+    ):
+        scene_id = batch.get("scene_id", "unknown")
+        if isinstance(scene_id, (list, tuple)) and scene_id:
+            scene_id = ",".join(str(item) for item in scene_id[:4])
+        lines = [
+            f"{reason} at batch {batch_idx}, scene_id={scene_id}, loss={_scalar(loss)}",
+            _tensor_stats("coded_image", batch["coded_image"]),
+            _tensor_stats("target", batch["target"]),
+            _tensor_stats("off_frames", batch["off_frames"]),
+            _tensor_stats("output", output),
+        ]
+        if reblurred is not None:
+            lines.append(_tensor_stats("reblurred", reblurred))
+        if grad_stats is not None:
+            lines.append(
+                "gradients: "
+                f"finite={grad_stats['finite']}, "
+                f"global_norm={_format_number(grad_stats['global_norm'])}, "
+                f"max_abs={_format_number(grad_stats['max_abs'])}"
+            )
+        return "\n".join(lines)
 
 
 def trainning(gpus, config):
@@ -214,3 +298,60 @@ def _move_batch(batch, device):
     for key, value in batch.items():
         moved[key] = value.to(device) if isinstance(value, torch.Tensor) else value
     return moved
+
+
+def _prepare_metric_input(tensor: torch.Tensor, clamp: bool) -> torch.Tensor:
+    tensor = tensor.detach()
+    if clamp:
+        tensor = tensor.clamp(0, 1)
+    return tensor
+
+
+def _gradient_stats(model: torch.nn.Module) -> dict:
+    total_sq = 0.0
+    max_abs = 0.0
+    finite = True
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach()
+        grad_is_finite = torch.isfinite(grad)
+        if not bool(grad_is_finite.all()):
+            finite = False
+        finite_grad = grad[grad_is_finite]
+        if finite_grad.numel() == 0:
+            continue
+        finite_grad = finite_grad.float()
+        total_sq += float(torch.sum(finite_grad * finite_grad).item())
+        max_abs = max(max_abs, float(finite_grad.abs().max().item()))
+    return {
+        "finite": finite,
+        "global_norm": total_sq ** 0.5,
+        "max_abs": max_abs,
+    }
+
+
+def _tensor_stats(name: str, tensor: torch.Tensor) -> str:
+    data = tensor.detach()
+    finite = torch.isfinite(data)
+    finite_count = int(finite.sum().item())
+    total = data.numel()
+    if finite_count == 0:
+        return f"{name}: shape={tuple(data.shape)}, finite=0/{total}"
+
+    values = data[finite].float()
+    return (
+        f"{name}: shape={tuple(data.shape)}, finite={finite_count}/{total}, "
+        f"min={_format_number(float(values.min().item()))}, "
+        f"max={_format_number(float(values.max().item()))}, "
+        f"mean={_format_number(float(values.mean().item()))}, "
+        f"std={_format_number(float(values.std(unbiased=False).item()))}"
+    )
+
+
+def _scalar(tensor: torch.Tensor) -> str:
+    return _format_number(float(tensor.detach().item()))
+
+
+def _format_number(value: float) -> str:
+    return f"{value:.6g}"
