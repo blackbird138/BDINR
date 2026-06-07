@@ -25,7 +25,7 @@ def test_worker(gpus, config):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading checkpoint: {config.checkpoint} ...")
-    checkpoint = torch.load(config.checkpoint, map_location=device)
+    checkpoint = torch.load(config.checkpoint, map_location=device, weights_only=False)
     logger.info("Checkpoint loaded")
 
     loaded_config = OmegaConf.create(checkpoint["config"]) if "config" in checkpoint else config

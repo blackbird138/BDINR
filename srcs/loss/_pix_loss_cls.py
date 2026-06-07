@@ -132,6 +132,17 @@ class SSIMLoss(SSIM):
 
 
 @add2loss
+class OneMinusSSIMLoss(SSIM):
+    """SSIM distance for inputs normalized to [0, 1]."""
+
+    def __init__(self, data_range=1.0, **kwargs):
+        super(OneMinusSSIMLoss, self).__init__(data_range=data_range, **kwargs)
+
+    def forward(self, output, target):
+        return 1.0 - super().forward(output, target)
+
+
+@add2loss
 class EdgeLoss(nn.Module):
     def __init__(self):
         super(EdgeLoss, self).__init__()
