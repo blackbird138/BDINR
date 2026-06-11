@@ -110,12 +110,15 @@ def get_coded_flash_pair_loaders(
     train_fraction: float = 0.90,
     val_fraction: float = 0.05,
     read_source: str = "npz",
+    scene_ids: str | list[str] | None = None,
 ) -> DataLoader | tuple[DataLoader, DataLoader]:
     """Build train/valid/test loaders from sorted scene ids."""
     root = Path(root)
     read_source = _normalize_read_source(read_source)
+    status = str(status).lower()
     scene_paths = discover_complete_scenes(root, frame_indices or DEFAULT_FRAME_INDICES, read_source=read_source)
-    train_scenes, val_scenes, test_scenes = split_scenes(scene_paths, train_fraction, val_fraction)
+    scene_ids_requested = _has_scene_ids(scene_ids)
+    scene_paths = _filter_scene_paths(scene_paths, scene_ids)
 
     loader_kwargs = {
         "batch_size": int(batch_size),
@@ -124,6 +127,15 @@ def get_coded_flash_pair_loaders(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    if status in {"all", "infer", "inference"} or (scene_ids_requested and status in {"valid", "val", "test"}):
+        dataset = PairedOnOffCodedFlashDataset(
+            root, scene_paths, frame_indices, code, patch_size=None, tform_op=None, split=status, read_source=read_source
+        )
+        sampler = DistributedSampler(dataset, shuffle=False) if dist.is_initialized() else None
+        return DataLoader(dataset, shuffle=False, sampler=sampler, **loader_kwargs)
+
+    train_scenes, val_scenes, test_scenes = split_scenes(scene_paths, train_fraction, val_fraction)
 
     if status == "train":
         train_dataset = PairedOnOffCodedFlashDataset(
@@ -157,7 +169,7 @@ def get_coded_flash_pair_loaders(
             root, test_scenes, frame_indices, code, patch_size=None, tform_op=None, split="test", read_source=read_source
         )
     else:
-        raise NotImplementedError(f"status ({status}) should be 'train' | 'valid' | 'test'")
+        raise NotImplementedError(f"status ({status}) should be 'train' | 'valid' | 'test' | 'all'")
 
     sampler = DistributedSampler(dataset, shuffle=False) if dist.is_initialized() else None
     return DataLoader(dataset, shuffle=False, sampler=sampler, **loader_kwargs)
@@ -167,7 +179,10 @@ def discover_complete_scenes(root: str | Path, frame_indices: list[int], read_so
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"coded-flash root does not exist: {root}")
-    scenes = sorted(path for path in root.glob("scene_*") if path.is_dir())
+    if root.is_dir() and root.name.startswith("scene_"):
+        scenes = [root]
+    else:
+        scenes = sorted(path for path in root.glob("scene_*") if path.is_dir())
     complete = []
     read_source = _normalize_read_source(read_source)
     for scene in scenes:
@@ -176,6 +191,28 @@ def discover_complete_scenes(root: str | Path, frame_indices: list[int], read_so
     if not complete:
         raise FileNotFoundError(f"No complete scene_* folders found under {root}")
     return complete
+
+
+def _filter_scene_paths(scene_paths: list[Path], scene_ids: str | list[str] | None) -> list[Path]:
+    if not _has_scene_ids(scene_ids):
+        return scene_paths
+    if isinstance(scene_ids, str):
+        scene_ids = [scene_ids]
+    requested = {Path(scene_id).name for scene_id in scene_ids}
+    filtered = [scene for scene in scene_paths if scene.name in requested]
+    found = {scene.name for scene in filtered}
+    missing = sorted(requested - found)
+    if missing:
+        raise FileNotFoundError(f"Requested scene_ids were not found or incomplete: {missing}")
+    return filtered
+
+
+def _has_scene_ids(scene_ids: str | list[str] | None) -> bool:
+    if scene_ids is None:
+        return False
+    if isinstance(scene_ids, str):
+        return bool(scene_ids)
+    return len(scene_ids) > 0
 
 
 def split_scenes(

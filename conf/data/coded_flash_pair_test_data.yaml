@@ -5,6 +5,7 @@ batch_size: 1
 frame_indices: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
 code: ${arch.ce_code_init}
 read_source: npz
+scene_ids:
 patch_size:
 tform_op:
 status: test
