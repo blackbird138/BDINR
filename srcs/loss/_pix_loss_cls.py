@@ -172,6 +172,153 @@ class EdgeLoss(nn.Module):
         return loss
 
 
+class CodedFlashPairLoss(nn.Module):
+    """Composite loss for paired on/off coded-flash sequence restoration."""
+
+    def __init__(
+        self,
+        gamma=2.2,
+        foreground_weight=4.0,
+        linear_seq_weight=0.2,
+        srgb_seq_weight=1.0,
+        ssim_weight=0.1,
+        edge_weight=0.05,
+        reblur_weight=0.2,
+        eps=1e-3,
+        ssim_win_size=7,
+    ):
+        super(CodedFlashPairLoss, self).__init__()
+        self.gamma = float(gamma)
+        self.foreground_weight = float(foreground_weight)
+        self.linear_seq_weight = float(linear_seq_weight)
+        self.srgb_seq_weight = float(srgb_seq_weight)
+        self.ssim_weight = float(ssim_weight)
+        self.edge_weight = float(edge_weight)
+        self.reblur_weight = float(reblur_weight)
+        self.eps = float(eps)
+        self.ssim_win_size = int(ssim_win_size)
+        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3, win_size=self.ssim_win_size)
+
+        k = torch.Tensor([[.05, .25, .4, .25, .05]])
+        self.register_buffer("edge_kernel", torch.matmul(k.t(), k).unsqueeze(0).repeat(3, 1, 1, 1))
+
+    def forward(self, pred_sequence, batch):
+        target = batch["target"]
+        off_frames = batch["off_frames"]
+        coded_image = batch["coded_image"]
+        code = batch["code"]
+        if "mask" not in batch:
+            raise KeyError("CodedFlashPairLoss requires batch['mask']; set data_loader.use_mask=true")
+        mask = batch["mask"]
+
+        self._validate_shapes(pred_sequence, target, off_frames, coded_image, mask)
+
+        weight = self._mask_weight(mask, pred_sequence.dtype)
+        seq_weight = weight[:, None, :, :, :]
+
+        pred_srgb = self._linear_to_srgb(pred_sequence)
+        target_srgb = self._linear_to_srgb(target)
+
+        loss_linear_seq = self._weighted_charbonnier(pred_sequence, target, seq_weight)
+        loss_srgb_seq = self._weighted_charbonnier(pred_srgb, target_srgb, seq_weight)
+        loss_ssim = self._masked_ssim_distance(pred_srgb, target_srgb, mask)
+        loss_edge = self._masked_edge_loss(pred_srgb, target_srgb, seq_weight)
+
+        reblurred = self._coded_flash_reblur(pred_sequence, off_frames, code)
+        loss_reblur = self._charbonnier(reblurred, coded_image)
+
+        total = (
+            self.linear_seq_weight * loss_linear_seq
+            + self.srgb_seq_weight * loss_srgb_seq
+            + self.ssim_weight * loss_ssim
+            + self.edge_weight * loss_edge
+            + self.reblur_weight * loss_reblur
+        )
+        parts = {
+            "loss_linear_seq": loss_linear_seq.detach(),
+            "loss_srgb_seq": loss_srgb_seq.detach(),
+            "loss_ssim": loss_ssim.detach(),
+            "loss_edge": loss_edge.detach(),
+            "loss_reblur": loss_reblur.detach(),
+        }
+        return {"loss": total, "parts": parts, "reblurred": reblurred}
+
+    def _validate_shapes(self, pred_sequence, target, off_frames, coded_image, mask):
+        if pred_sequence.ndim != 5 or target.ndim != 5 or off_frames.ndim != 5:
+            raise ValueError("pred_sequence, target, and off_frames must have shape [B,T,C,H,W]")
+        if pred_sequence.shape != target.shape or pred_sequence.shape != off_frames.shape:
+            raise ValueError("pred_sequence, target, and off_frames must have the same shape")
+        if coded_image.shape != pred_sequence[:, 0].shape:
+            raise ValueError("coded_image must have shape [B,C,H,W]")
+        if mask.ndim != 4 or mask.shape[1] != 1 or mask.shape[0] != pred_sequence.shape[0]:
+            raise ValueError("mask must have shape [B,1,H,W]")
+        if mask.shape[-2:] != pred_sequence.shape[-2:]:
+            raise ValueError("mask spatial shape must match pred_sequence")
+
+    def _mask_weight(self, mask, dtype):
+        weight = 1.0 + self.foreground_weight * mask.to(dtype=dtype)
+        denom = weight.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        return weight / denom
+
+    def _linear_to_srgb(self, tensor):
+        return torch.clamp(tensor, 0.0, 1.0).pow(1.0 / self.gamma)
+
+    def _charbonnier(self, output, target):
+        diff = output - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
+
+    def _weighted_charbonnier(self, output, target, weight):
+        diff = output - target
+        loss = torch.sqrt(diff * diff + self.eps * self.eps)
+        return torch.mean(loss * weight.to(device=output.device, dtype=output.dtype))
+
+    def _masked_ssim_distance(self, pred_srgb, target_srgb, mask):
+        if min(pred_srgb.shape[-2:]) < self.ssim_win_size:
+            return pred_srgb.new_zeros(())
+        mask_seq = mask[:, None, :, :, :].to(device=pred_srgb.device, dtype=pred_srgb.dtype)
+        mask_seq = mask_seq.expand(-1, pred_srgb.shape[1], -1, -1, -1)
+        pred_flat = torch.flatten(pred_srgb * mask_seq + target_srgb * (1.0 - mask_seq), end_dim=1)
+        target_flat = torch.flatten(target_srgb, end_dim=1)
+        self.ssim.to(device=pred_flat.device)
+        return 1.0 - self.ssim(pred_flat, target_flat)
+
+    def _masked_edge_loss(self, pred_srgb, target_srgb, seq_weight):
+        pred_flat = torch.flatten(pred_srgb, end_dim=1)
+        target_flat = torch.flatten(target_srgb, end_dim=1)
+        weight_flat = seq_weight.expand(-1, pred_srgb.shape[1], -1, -1, -1)
+        weight_flat = torch.flatten(weight_flat, end_dim=1)
+        pred_edge = self._laplacian_kernel(pred_flat)
+        target_edge = self._laplacian_kernel(target_flat)
+        return self._weighted_charbonnier(pred_edge, target_edge, weight_flat)
+
+    def _laplacian_kernel(self, current):
+        filtered = self._conv_gauss(current)
+        down = filtered[:, :, ::2, ::2]
+        new_filter = torch.zeros_like(filtered)
+        new_filter[:, :, ::2, ::2] = down * 4
+        filtered = self._conv_gauss(new_filter)
+        return current - filtered
+
+    def _conv_gauss(self, image):
+        kernel = self.edge_kernel.to(device=image.device, dtype=image.dtype)
+        _, _, kw, kh = kernel.shape
+        image = F.pad(image, (kw // 2, kh // 2, kw // 2, kh // 2), mode="replicate")
+        return F.conv2d(image, kernel, groups=image.shape[1])
+
+    def _coded_flash_reblur(self, sequence, off_frames, code):
+        batch, frame_n = sequence.shape[:2]
+        code = code.to(device=sequence.device, dtype=sequence.dtype)
+        if code.ndim == 1:
+            code = code.view(1, frame_n, 1, 1, 1)
+        elif code.ndim == 2:
+            if code.shape[0] != batch or code.shape[1] != frame_n:
+                raise ValueError("batched code must have shape [B,T]")
+            code = code.view(batch, frame_n, 1, 1, 1)
+        else:
+            raise ValueError("code must have shape [T] or [B,T]")
+        return torch.mean(off_frames + code * (sequence - off_frames), dim=1)
+
+
 @add2loss
 class FFTLoss(nn.Module):
     def __init__(self):

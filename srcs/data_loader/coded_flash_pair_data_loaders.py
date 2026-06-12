@@ -30,6 +30,7 @@ class PairedOnOffCodedFlashDataset(Dataset):
         tform_op: str | list[str] | None = None,
         split: str = "train",
         read_source: str = "npz",
+        use_mask: bool = False,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -40,6 +41,7 @@ class PairedOnOffCodedFlashDataset(Dataset):
         self.tform_op = _normalize_tform_op(tform_op)
         self.split = split
         self.read_source = _normalize_read_source(read_source)
+        self.use_mask = bool(use_mask)
 
         if self.code.ndim != 1 or not np.all(np.isin(self.code, [0.0, 1.0])):
             raise ValueError("code must be a one-dimensional binary list")
@@ -54,8 +56,9 @@ class PairedOnOffCodedFlashDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         scene_path = self.scene_paths[index]
         off, on, source_meta = _read_scene_pair(scene_path, self.frame_indices, self.read_source)
-        off, on = self._crop_pair(off, on)
-        off, on = _spatial_transform_pair(off, on, self.tform_op)
+        mask = _read_mask(scene_path / "mask.png", off.shape[1:3]) if self.use_mask else None
+        off, on, mask = self._crop_sample(off, on, mask)
+        off, on, mask = _spatial_transform_sample(off, on, mask, self.tform_op)
 
         code = self.code.astype(np.float32)
         coded = np.mean(off + code[:, None, None, None] * (on - off), axis=0)
@@ -69,6 +72,8 @@ class PairedOnOffCodedFlashDataset(Dataset):
             "frame_indices": torch.tensor(self.frame_indices, dtype=torch.long),
             "scene_id": scene_path.name,
         }
+        if mask is not None:
+            sample["mask"] = _to_mask_tensor(mask)
         meta = _load_meta(scene_path / "frames_float_meta.json")
         meta.update(source_meta)
         if meta:
@@ -76,9 +81,14 @@ class PairedOnOffCodedFlashDataset(Dataset):
             sample["exposure_scale"] = torch.tensor(float(meta.get("exposure_scale", 0.0)), dtype=torch.float32)
         return sample
 
-    def _crop_pair(self, off: np.ndarray, on: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _crop_sample(
+        self,
+        off: np.ndarray,
+        on: np.ndarray,
+        mask: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         if self.patch_size is None:
-            return off, on
+            return off, on, mask
         patch_h, patch_w = self.patch_size
         height, width = off.shape[1:3]
         if height < patch_h or width < patch_w:
@@ -89,10 +99,11 @@ class PairedOnOffCodedFlashDataset(Dataset):
         else:
             y0 = (height - patch_h) // 2
             x0 = (width - patch_w) // 2
-        return (
-            off[:, y0 : y0 + patch_h, x0 : x0 + patch_w, :],
-            on[:, y0 : y0 + patch_h, x0 : x0 + patch_w, :],
-        )
+        off = off[:, y0 : y0 + patch_h, x0 : x0 + patch_w, :]
+        on = on[:, y0 : y0 + patch_h, x0 : x0 + patch_w, :]
+        if mask is not None:
+            mask = mask[y0 : y0 + patch_h, x0 : x0 + patch_w, :]
+        return off, on, mask
 
 
 def get_coded_flash_pair_loaders(
@@ -111,6 +122,7 @@ def get_coded_flash_pair_loaders(
     val_fraction: float = 0.05,
     read_source: str = "npz",
     scene_ids: str | list[str] | None = None,
+    use_mask: bool = False,
 ) -> DataLoader | tuple[DataLoader, DataLoader]:
     """Build train/valid/test loaders from sorted scene ids."""
     root = Path(root)
@@ -130,7 +142,15 @@ def get_coded_flash_pair_loaders(
 
     if status in {"all", "infer", "inference"} or (scene_ids_requested and status in {"valid", "val", "test"}):
         dataset = PairedOnOffCodedFlashDataset(
-            root, scene_paths, frame_indices, code, patch_size=None, tform_op=None, split=status, read_source=read_source
+            root,
+            scene_paths,
+            frame_indices,
+            code,
+            patch_size=None,
+            tform_op=None,
+            split=status,
+            read_source=read_source,
+            use_mask=use_mask,
         )
         sampler = DistributedSampler(dataset, shuffle=False) if dist.is_initialized() else None
         return DataLoader(dataset, shuffle=False, sampler=sampler, **loader_kwargs)
@@ -139,10 +159,26 @@ def get_coded_flash_pair_loaders(
 
     if status == "train":
         train_dataset = PairedOnOffCodedFlashDataset(
-            root, train_scenes, frame_indices, code, patch_size, tform_op, split="train", read_source=read_source
+            root,
+            train_scenes,
+            frame_indices,
+            code,
+            patch_size,
+            tform_op,
+            split="train",
+            read_source=read_source,
+            use_mask=use_mask,
         )
         val_dataset = PairedOnOffCodedFlashDataset(
-            root, val_scenes, frame_indices, code, patch_size=patch_size, tform_op=None, split="valid", read_source=read_source
+            root,
+            val_scenes,
+            frame_indices,
+            code,
+            patch_size=patch_size,
+            tform_op=None,
+            split="valid",
+            read_source=read_source,
+            use_mask=use_mask,
         )
         train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
@@ -162,11 +198,27 @@ def get_coded_flash_pair_loaders(
 
     if status in {"valid", "val"}:
         dataset = PairedOnOffCodedFlashDataset(
-            root, val_scenes, frame_indices, code, patch_size=None, tform_op=None, split="valid", read_source=read_source
+            root,
+            val_scenes,
+            frame_indices,
+            code,
+            patch_size=None,
+            tform_op=None,
+            split="valid",
+            read_source=read_source,
+            use_mask=use_mask,
         )
     elif status == "test":
         dataset = PairedOnOffCodedFlashDataset(
-            root, test_scenes, frame_indices, code, patch_size=None, tform_op=None, split="test", read_source=read_source
+            root,
+            test_scenes,
+            frame_indices,
+            code,
+            patch_size=None,
+            tform_op=None,
+            split="test",
+            read_source=read_source,
+            use_mask=use_mask,
         )
     else:
         raise NotImplementedError(f"status ({status}) should be 'train' | 'valid' | 'test' | 'all'")
@@ -240,6 +292,23 @@ def _read_rgb(path: Path) -> np.ndarray:
         raise FileNotFoundError(f"Image read failed: {path}")
     image = Image.open(path).convert("RGB")
     return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _read_mask(path: Path, expected_hw: tuple[int, int]) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing mask.png: {path}")
+    try:
+        mask = np.asarray(Image.open(path))
+    except Exception as exc:
+        raise ValueError(f"Mask read failed: {path}") from exc
+    if mask.ndim != 2:
+        raise ValueError(f"mask.png must be a single-channel image: {path}")
+    if tuple(mask.shape) != tuple(expected_hw):
+        raise ValueError(f"mask.png shape {mask.shape} does not match frame size {expected_hw}: {path}")
+    mask = mask.astype(np.float32)
+    if mask.max() > 1.0:
+        mask = mask / 255.0
+    return np.clip(mask, 0.0, 1.0)[..., None]
 
 
 def _read_scene_pair(scene_path: Path, frame_indices: list[int], read_source: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -318,6 +387,10 @@ def _to_tchw_tensor(frames: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(frames.transpose(0, 3, 1, 2))).float()
 
 
+def _to_mask_tensor(mask: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(mask.transpose(2, 0, 1))).float()
+
+
 def _normalize_patch_size(patch_size: int | list[int] | tuple[int, int] | None) -> tuple[int, int] | None:
     if patch_size is None:
         return None
@@ -348,28 +421,37 @@ def _normalize_read_source(read_source: str) -> str:
     return read_source
 
 
-def _spatial_transform_pair(
+def _spatial_transform_sample(
     off: np.ndarray,
     on: np.ndarray,
+    mask: np.ndarray | None,
     tform_op: set[str],
     prob: float = 0.5,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     if "flip" in tform_op:
         if np.random.rand() < prob:
             off = off[:, :, ::-1, :]
             on = on[:, :, ::-1, :]
+            if mask is not None:
+                mask = mask[:, ::-1, :]
         if np.random.rand() < prob:
             off = off[:, ::-1, :, :]
             on = on[:, ::-1, :, :]
+            if mask is not None:
+                mask = mask[::-1, :, :]
     if "rotate" in tform_op:
         draw = np.random.rand()
         if prob / 4 < draw <= prob / 2:
             off = np.transpose(off, axes=(0, 2, 1, 3))[:, ::-1, ...]
             on = np.transpose(on, axes=(0, 2, 1, 3))[:, ::-1, ...]
+            if mask is not None:
+                mask = np.transpose(mask, axes=(1, 0, 2))[::-1, ...]
         elif prob / 2 < draw <= prob:
             off = np.transpose(off[:, ::-1, :, :][:, :, ::-1, :], axes=(0, 2, 1, 3))[:, ::-1, ...]
             on = np.transpose(on[:, ::-1, :, :][:, :, ::-1, :], axes=(0, 2, 1, 3))[:, ::-1, ...]
-    return off.copy(), on.copy()
+            if mask is not None:
+                mask = np.transpose(mask[::-1, :, :][:, ::-1, :], axes=(1, 0, 2))[::-1, ...]
+    return off.copy(), on.copy(), None if mask is None else mask.copy()
 
 
 def _load_meta(path: Path) -> dict[str, Any]:

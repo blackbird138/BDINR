@@ -1,0 +1,32 @@
+# @package _global_
+network_name: coded_flash
+arch:
+  _target_: srcs.model.coded_flash_model.CodedFlashBDINR
+  ce_code_n: 16
+  frame_n: ${frame_n}
+  ce_code_init: [1,1,0,0,1,1,1,0,0,0,0,0,1,1,0,1] # MTF-only 16-bit
+  bd_net: BDNeRV_RC
+loss: {'coded_flash_loss': 1}
+coded_flash_loss:
+  _target_: srcs.loss._pix_loss_cls.CodedFlashPairLoss
+  gamma: 2.2
+  foreground_weight: 4.0
+  linear_seq_weight: 0.2
+  srgb_seq_weight: 1.0
+  ssim_weight: 0.1
+  edge_weight: 0.05
+  reblur_weight: 0.2
+
+optimizer:
+  _target_: srcs.optimizer.adan.Adan
+  lr: !!float 1e-4
+  max_grad_norm: 1.0
+lr_scheduler:
+  _target_: srcs.scheduler._base_scheduler.getGradualWarmupScheduler
+  multiplier: 1
+  warmup_epochs: 2
+  after_scheduler_conf:
+    type: torch.optim.lr_scheduler.CosineAnnealingLR
+    args:
+      T_max: ${trainer.epochs}
+      eta_min: 1e-6

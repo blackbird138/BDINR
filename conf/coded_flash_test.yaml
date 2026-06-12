@@ -17,6 +17,8 @@ outputs_dir: outputs/
 gpus: [0]
 num_workers: 0
 save_img: true
+save_img_space: srgb
+eval_gamma: 2.2
 
 # params
 frame_n: 16

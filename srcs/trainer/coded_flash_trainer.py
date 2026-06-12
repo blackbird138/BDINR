@@ -55,6 +55,12 @@ class Trainer(BaseTrainer):
         code = batch["code"]
 
         output = self.model(coded)
+
+        if "coded_flash_loss" in self.criterion:
+            result = self.criterion["coded_flash_loss"](output, batch)
+            loss = self.losses.get("coded_flash_loss", 1.0) * result["loss"]
+            return loss, output, result.get("reblurred"), result.get("parts", {})
+
         output_flat = torch.flatten(output, end_dim=1)
         target_flat = torch.flatten(target, end_dim=1)
 
@@ -64,7 +70,7 @@ class Trainer(BaseTrainer):
             reblurred = coded_flash_reblur(output, off_frames, code)
             loss = loss + self.losses["reblur_loss"] * self.criterion["reblur_loss"](reblurred, coded)
 
-        return loss, output, reblurred
+        return loss, output, reblurred, {}
 
     def _compute_metrics(self, output, target):
         output_flat = torch.flatten(output, end_dim=1)
@@ -79,7 +85,7 @@ class Trainer(BaseTrainer):
             metrics[metric.__name__] = metric_value
         return metrics
 
-    def _after_iter(self, epoch, batch_idx, phase, loss, metrics):
+    def _after_iter(self, epoch, batch_idx, phase, loss, metrics, loss_parts=None):
         self.writer.set_step(
             (epoch - 1) * getattr(self, f"limit_{phase}_iters") + batch_idx,
             speed_chk=phase,
@@ -89,6 +95,10 @@ class Trainer(BaseTrainer):
         for key, value in metrics.items():
             value = value.item() if isinstance(value, torch.Tensor) else value
             getattr(self, f"{phase}_metrics").update(key, value)
+        for key, value in (loss_parts or {}).items():
+            if isinstance(value, torch.Tensor):
+                value = value.item() if self.config.n_gpu == 1 else collect(value).item()
+            self.writer.add_scalar(f"{key}/{phase}", value)
 
     def _train_epoch(self, epoch):
         self.model.train()
@@ -97,7 +107,7 @@ class Trainer(BaseTrainer):
 
         for batch_idx, batch in enumerate(self.data_loader):
             batch = _move_batch(batch, self.device)
-            loss, output, reblurred = self._compute_loss(batch)
+            loss, output, reblurred, loss_parts = self._compute_loss(batch)
 
             self.optimizer.zero_grad()
             if not torch.isfinite(loss):
@@ -134,10 +144,11 @@ class Trainer(BaseTrainer):
 
             if batch_idx % self.logging_step == 0 or (batch_idx + 1) == self.limit_train_iters:
                 metrics = self._compute_metrics(output, batch["target"])
-                self._after_iter(epoch, batch_idx, "train", loss, metrics)
+                self._after_iter(epoch, batch_idx, "train", loss, metrics, loss_parts)
                 self.logger.info(
                     f"Train Epoch: {epoch} {self._progress(batch_idx)} "
-                    f"Loss: {loss:.6f} Lr: {self.optimizer.param_groups[0]['lr']:.3e}"
+                    f"Loss: {loss:.6f}{_format_loss_parts(loss_parts)} "
+                    f"Lr: {self.optimizer.param_groups[0]['lr']:.3e}"
                 )
 
             last_images = (batch, output.detach())
@@ -165,7 +176,7 @@ class Trainer(BaseTrainer):
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.valid_data_loader):
                 batch = _move_batch(batch, self.device)
-                loss, output, reblurred = self._compute_loss(batch)
+                loss, output, reblurred, loss_parts = self._compute_loss(batch)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(
                         self._format_nonfinite_debug(
@@ -178,7 +189,7 @@ class Trainer(BaseTrainer):
                         )
                     )
                 metrics = self._compute_metrics(output, batch["target"])
-                self._after_iter(epoch, batch_idx, "valid", loss, metrics)
+                self._after_iter(epoch, batch_idx, "valid", loss, metrics, loss_parts)
                 last_images = (batch, output.detach())
                 if (batch_idx + 1) == self.limit_valid_iters:
                     break
@@ -230,6 +241,8 @@ class Trainer(BaseTrainer):
             _tensor_stats("off_frames", batch["off_frames"]),
             _tensor_stats("output", output),
         ]
+        if "mask" in batch:
+            lines.append(_tensor_stats("mask", batch["mask"]))
         if reblurred is not None:
             lines.append(_tensor_stats("reblurred", reblurred))
         if grad_stats is not None:
@@ -264,6 +277,8 @@ def train_worker(config):
         criterion["main_loss"] = instantiate(config.main_loss)
     if "reblur_loss" in config.loss:
         criterion["reblur_loss"] = instantiate(config.reblur_loss)
+    if "coded_flash_loss" in config.loss:
+        criterion["coded_flash_loss"] = instantiate(config.coded_flash_loss)
     metrics = [instantiate(metric) for metric in config["metrics"]]
 
     optimizer = instantiate(config.optimizer, model.parameters())
@@ -355,3 +370,18 @@ def _scalar(tensor: torch.Tensor) -> str:
 
 def _format_number(value: float) -> str:
     return f"{value:.6g}"
+
+
+def _format_loss_parts(loss_parts) -> str:
+    if not loss_parts:
+        return ""
+    fields = []
+    for key, value in loss_parts.items():
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.numel() == 1:
+                value = float(value.item())
+            else:
+                value = float(value.mean().item())
+        fields.append(f" {key}: {_format_number(float(value))}")
+    return "".join(fields)
