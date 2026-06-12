@@ -185,6 +185,7 @@ class CodedFlashPairLoss(nn.Module):
         edge_weight=0.05,
         reblur_weight=0.2,
         eps=1e-3,
+        srgb_eps=1e-6,
         ssim_win_size=7,
     ):
         super(CodedFlashPairLoss, self).__init__()
@@ -196,6 +197,7 @@ class CodedFlashPairLoss(nn.Module):
         self.edge_weight = float(edge_weight)
         self.reblur_weight = float(reblur_weight)
         self.eps = float(eps)
+        self.srgb_eps = float(srgb_eps)
         self.ssim_win_size = int(ssim_win_size)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3, win_size=self.ssim_win_size)
 
@@ -261,7 +263,7 @@ class CodedFlashPairLoss(nn.Module):
         return weight / denom
 
     def _linear_to_srgb(self, tensor):
-        return torch.clamp(tensor, 0.0, 1.0).pow(1.0 / self.gamma)
+        return torch.clamp(tensor, self.srgb_eps, 1.0).pow(1.0 / self.gamma)
 
     def _charbonnier(self, output, target):
         diff = output - target

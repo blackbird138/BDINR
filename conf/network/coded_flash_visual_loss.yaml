@@ -16,6 +16,7 @@ coded_flash_loss:
   ssim_weight: 0.1
   edge_weight: 0.05
   reblur_weight: 0.2
+  srgb_eps: 1e-6
 
 optimizer:
   _target_: srcs.optimizer.adan.Adan
