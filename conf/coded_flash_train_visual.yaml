@@ -18,14 +18,14 @@ log_dir: events/
 
 ##### run
 gpus: [0]
-num_workers: 2
+num_workers: 4
 trainer:
-  epochs: 500
+  epochs: 200
   limit_train_iters: 500
   limit_valid_iters: 50
   monitor: min loss/valid
   saving_top_k: 5
-  landmark_list: [100,200,300,400]
+  landmark_list: [50,100,150]
   early_stop:
   logging_step: 100
   tensorboard: true

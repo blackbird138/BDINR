@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 import csv
 
+import imageio.v2 as imageio
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from srcs.utils.util import instantiate
-from srcs.utils.utils_image_kair import imsave, tensor2uint
+from srcs.utils.utils_image_kair import tensor2uint
 
 
 def testing(gpus, config):
@@ -47,9 +50,9 @@ def test(data_loader, model, device, metrics, config):
     model.eval()
     gamma = float(config.get("eval_gamma", 2.2))
     save_img_space = str(config.get("save_img_space", "srgb")).lower()
+    gif_duration = float(config.get("gif_duration", 0.2))
     if config.get("save_img", False):
-        for name in ("input", "output", "target"):
-            os.makedirs(os.path.join(config.outputs_dir, name), exist_ok=True)
+        os.makedirs(os.path.join(config.outputs_dir, "gif"), exist_ok=True)
 
     total_metrics = _init_metric_totals(metrics, device)
     time_start = time.time()
@@ -69,9 +72,17 @@ def test(data_loader, model, device, metrics, config):
 
             if config.get("save_img", False):
                 if save_img_space == "linear":
-                    _save_batch_images(config.outputs_dir, batch_idx, batch, coded, output, target)
+                    _save_batch_gifs(config.outputs_dir, batch_idx, batch, coded, output, target, gif_duration)
                 else:
-                    _save_batch_images(config.outputs_dir, batch_idx, batch, coded_srgb, output_srgb, target_srgb)
+                    _save_batch_gifs(
+                        config.outputs_dir,
+                        batch_idx,
+                        batch,
+                        coded_srgb,
+                        output_srgb,
+                        target_srgb,
+                        gif_duration,
+                    )
 
             output_flat = torch.flatten(output, end_dim=1)
             target_flat = torch.flatten(target, end_dim=1)
@@ -105,6 +116,12 @@ def test(data_loader, model, device, metrics, config):
         csv_path = os.path.join(config.outputs_dir, "per_scene_metrics.csv")
         _write_metric_csv(csv_path, per_scene_rows)
         log["per_scene_metrics"] = csv_path
+    metrics_json_path = os.path.join(config.outputs_dir, "metrics.json")
+    metrics_csv_path = os.path.join(config.outputs_dir, "metrics.csv")
+    log["metrics_json"] = metrics_json_path
+    log["metrics_csv"] = metrics_csv_path
+    _write_summary_json(metrics_json_path, log)
+    _write_summary_csv(metrics_csv_path, log)
     return log
 
 
@@ -149,6 +166,25 @@ def _write_metric_csv(path, rows):
         writer.writerows(rows)
 
 
+def _write_summary_json(path, log):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(log, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def _write_summary_csv(path, log):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(log.keys()))
+        writer.writeheader()
+        writer.writerow({key: _csv_value(value) for key, value in log.items()})
+
+
+def _csv_value(value):
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
 def _tensor_range_stats(prefix, tensor):
     values = tensor.detach().float()
     return {
@@ -184,21 +220,36 @@ def _linear_to_srgb(tensor, gamma):
     return torch.clamp(tensor, 0, 1).pow(1.0 / gamma)
 
 
-def _save_batch_images(outputs_dir, batch_idx, batch, coded, output, target):
+def _save_batch_gifs(outputs_dir, batch_idx, batch, coded, output, target, duration):
     batch_size, frame_n = output.shape[:2]
     scene_ids = batch.get("scene_id", None)
+    gif_dir = os.path.join(outputs_dir, "gif")
+    os.makedirs(gif_dir, exist_ok=True)
     for item_idx in range(batch_size):
         sample_id = _sample_tag(scene_ids, batch_idx * batch_size + item_idx + 1, item_idx)
-        imsave(tensor2uint(coded[item_idx]), os.path.join(outputs_dir, "input", f"coded#{sample_id}.jpg"))
+        input_img = _to_rgb_uint(coded[item_idx])
+        frames = []
         for frame_idx in range(frame_n):
-            imsave(
-                tensor2uint(output[item_idx, frame_idx]),
-                os.path.join(outputs_dir, "output", f"out-frame#{sample_id}-{frame_idx + 1:04d}.jpg"),
-            )
-            imsave(
-                tensor2uint(target[item_idx, frame_idx]),
-                os.path.join(outputs_dir, "target", f"gt-frame#{sample_id}-{frame_idx + 1:04d}.jpg"),
-            )
+            output_img = _to_rgb_uint(output[item_idx, frame_idx])
+            target_img = _to_rgb_uint(target[item_idx, frame_idx])
+            frames.append(np.concatenate((input_img, output_img, target_img), axis=1))
+        gif_path = os.path.join(gif_dir, f"scene#{_safe_filename(sample_id)}.gif")
+        imageio.mimsave(gif_path, frames, duration=duration, loop=0)
+
+
+def _to_rgb_uint(tensor):
+    image = tensor2uint(tensor)
+    if image.ndim == 2:
+        image = image[:, :, None]
+    if image.shape[2] == 1:
+        image = np.repeat(image, 3, axis=2)
+    elif image.shape[2] > 3:
+        image = image[:, :, :3]
+    return image
+
+
+def _safe_filename(value):
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value))
 
 
 def _sample_tag(scene_ids, fallback_id, item_idx):
